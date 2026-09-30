@@ -413,6 +413,15 @@ class BaseDSL(metaclass=DSLSingletonMeta):
         self._scoped_trace_finalize_hooks: ContextVar[
             tuple[Callable[[Any, ir.Module, str], None], ...]
         ] = ContextVar(f"{self.name}_trace_finalize_hooks", default=())
+        # Synchronous callbacks run after compilation or an in-memory cache
+        # hit, once the compilation has finished. Signature: listener(owner,
+        # *, function_name, module_hash, cache_hit, artifacts,
+        # compile_options, func_body, kernel_info). Listener exceptions are
+        # wrapped by the caller.
+        self._compilation_listeners: list[Callable[..., None]] = []
+        self._scoped_compilation_listeners: ContextVar[
+            tuple[Callable[..., None], ...]
+        ] = ContextVar(f"{self.name}_compilation_listeners", default=())
 
         if preprocess:
             preprocessor: DSLPreprocessor = DSLPreprocessor(dsl_package_name)
@@ -1735,6 +1744,129 @@ class BaseDSL(metaclass=DSLSingletonMeta):
             passes = f"pyir-prelower,{passes}"
         return f"builtin.module({passes})"
 
+    def register_compilation_listener(self, listener: Callable[..., None]) -> None:
+        """Register a callback run after compilation or a cache hit.
+
+        The listener is called synchronously as ``listener(owner, *,
+        function_name, module_hash, cache_hit, artifacts, compile_options,
+        func_body, kernel_info)``, where ``owner`` is this DSL instance,
+        ``module_hash`` identifies the compiled specialization, ``cache_hit``
+        is ``True`` only for an in-memory cache hit; a function loaded from
+        the file cache is reported like a fresh compilation, with
+        ``cache_hit=False``. ``artifacts`` is the ``JitFunctionArtifacts`` of
+        the compiled function (possibly holding ``None`` entries when artifact
+        keeping is off), ``func_body`` is the original Python function, and
+        ``kernel_info`` maps kernel names to kernel attributes. Device
+        functions compiled with ``DeviceTarget`` are not reported, nor is
+        ``cute.compile_to``, which exports the MLIR without compiling it.
+
+        The listener runs after the compilation has finished, so it may
+        compile other functions. Listeners must treat the payload as
+        read-only. More keyword arguments may be added later, so listeners
+        should accept ``**kwargs``. Passing ``None`` raises
+        ``DSLRuntimeError``; registering the same listener object more than
+        once is ignored.
+        """
+        if listener is None:
+            raise DSLRuntimeError("Compilation listener must not be None.")
+        if not callable(listener):
+            raise DSLRuntimeError("Compilation listener must be callable.")
+        if listener not in self._compilation_listeners:
+            self._compilation_listeners.append(listener)
+
+    def remove_compilation_listener(self, listener: Callable[..., None]) -> None:
+        """Remove a previously registered compilation listener (no-op if absent)."""
+        if listener in self._compilation_listeners:
+            self._compilation_listeners.remove(listener)
+
+    @contextmanager
+    def compilation_listeners(
+        self,
+        listeners: Callable[..., None] | Iterable[Callable[..., None]],
+    ) -> Generator[None, Any, None]:
+        """Temporarily register compilation listeners in the current context.
+
+        Args:
+            listeners: A single listener or iterable of listeners, each called
+                as ``listener(owner, *, function_name, module_hash, cache_hit,
+                artifacts, compile_options, func_body, kernel_info)``.
+
+        Scoped listeners are stored in ``_scoped_compilation_listeners`` for
+        the duration of the context, preserving order and ignoring duplicates.
+        The context manager restores the previous listener state when the
+        ``with`` block exits.
+
+        Raises:
+            DSLRuntimeError: If ``listeners`` is neither callable nor iterable,
+                or if any listener entry is ``None`` or not callable.
+        """
+        scoped_listeners: tuple[Callable[..., None], ...]
+        if callable(listeners):
+            scoped_listeners = (listeners,)
+        else:
+            try:
+                scoped_listeners = tuple(listeners)
+            except TypeError as e:
+                raise DSLRuntimeError(
+                    "Compilation listeners must be callable or iterable."
+                ) from e
+
+        for listener in scoped_listeners:
+            if listener is None:
+                raise DSLRuntimeError("Compilation listener must not be None.")
+            if not callable(listener):
+                raise DSLRuntimeError("Compilation listener must be callable.")
+
+        current_listeners = self._scoped_compilation_listeners.get()
+        combined_listeners = list(current_listeners)
+        for listener in scoped_listeners:
+            if listener not in combined_listeners:
+                combined_listeners.append(listener)
+        token = self._scoped_compilation_listeners.set(tuple(combined_listeners))
+        try:
+            yield
+        finally:
+            self._scoped_compilation_listeners.reset(token)
+
+    def _run_compilation_listeners(
+        self,
+        *,
+        function_name: str,
+        module_hash: str | None,
+        cache_hit: bool,
+        artifacts: JitFunctionArtifacts | None,
+        compile_options: CompileOptions,
+        func_body: Callable[..., Any] | None,
+        kernel_info: dict[str, Any],
+    ) -> None:
+        listeners = list(self._compilation_listeners)
+        for listener in self._scoped_compilation_listeners.get():
+            if listener not in listeners:
+                listeners.append(listener)
+
+        for listener in listeners:
+            try:
+                listener(
+                    self,
+                    function_name=function_name,
+                    module_hash=module_hash,
+                    cache_hit=cache_hit,
+                    artifacts=artifacts,
+                    compile_options=compile_options,
+                    func_body=func_body,
+                    kernel_info=kernel_info,
+                )
+            except Exception as e:
+                listener_name = getattr(
+                    listener,
+                    "__qualname__",
+                    getattr(listener, "__name__", repr(listener)),
+                )
+                # DSLRuntimeError inherits DSLBaseError, which formats ``cause``.
+                raise DSLRuntimeError(
+                    f"Compilation listener failed: {listener_name}", cause=e
+                ) from e
+
     def _compile_clone_and_save(
         self, module: ir.Module, pipeline: str, label: str
     ) -> Any:
@@ -1927,7 +2059,17 @@ class BaseDSL(metaclass=DSLSingletonMeta):
         # Build IR module
         module, result = self._maybe_profile(build_ir_module)()
         self._run_trace_finalize_hooks(module, function_name)
-        module_hash = None if no_cache else self.get_module_hash(module, function_name)
+        # Listeners tell specializations apart by module hash, so compute it
+        # even when caching is off (cute.compile, KEEP=ptx/cubin/sass, no_cache).
+        needs_module_hash = not no_cache or any(
+            (
+                self._compilation_listeners,
+                self._scoped_compilation_listeners.get(),
+            )
+        )
+        module_hash = (
+            self.get_module_hash(module, function_name) if needs_module_hash else None
+        )
 
         module = self.build_module(module, function_name)
 
@@ -2062,6 +2204,7 @@ class BaseDSL(metaclass=DSLSingletonMeta):
         function_name: str,
         dynamic_args: Any,
         dynamic_kwargs: Any,
+        module_hash: str | None = None,
     ) -> JitCompiledFunction:
         """Construct the JitCompiledFunction wrapper from a compiled module + engine."""
         fn = func_type(
@@ -2087,6 +2230,7 @@ class BaseDSL(metaclass=DSLSingletonMeta):
             dynamic_args=dynamic_args,
             dynamic_kwargs=dynamic_kwargs,
             host_target=self.compile_options.host_target,
+            module_hash=module_hash,
         )
         if isinstance(fn, JitCompiledFunction):
             fn.execution_args.set_adapter_scope(self._jit_arg_adapter_scope)
@@ -2343,6 +2487,7 @@ class BaseDSL(metaclass=DSLSingletonMeta):
                     or cached_jit_func.capi_func is None
                 ):
                     # no cache or cache miss, do ir generation/compilation/jit engine
+                    cache_hit = False
                     jit_function = self.compile_and_cache(
                         module,
                         module_hash,
@@ -2366,12 +2511,20 @@ class BaseDSL(metaclass=DSLSingletonMeta):
                     jit_function.seal_specialization(_pyir_take_sealed_spec())
                 else:
                     # cache hit
+                    cache_hit = True
                     log().info(
                         "JIT cache hit IN-MEMORY function=[%s] module_hash=[%s]",
                         function_name,
                         module_hash,
                     )
                     jit_function = cached_jit_func
+
+                # Keep this compilation's state for the compilation listeners,
+                # which run after the MLIR context exits. The cleanup in the
+                # finally block below rebinds kernel_info and compile_options
+                # rather than clearing them, so these references stay valid.
+                compilation_options = self.compile_options
+                compilation_kernel_info = self.kernel_info
 
             finally:
                 if _loc_tb_ctx is not None:
@@ -2380,6 +2533,19 @@ class BaseDSL(metaclass=DSLSingletonMeta):
                     except Exception:
                         pass
                 self.post_compilation_cleanup()
+
+        # Notify compilation listeners, for both fresh compilations and
+        # in-memory cache hits. This runs outside the compilation, so a
+        # listener may itself compile other functions.
+        self._run_compilation_listeners(
+            function_name=function_name,
+            module_hash=module_hash,
+            cache_hit=cache_hit,
+            artifacts=jit_function.artifacts,
+            compile_options=compilation_options,
+            func_body=funcBody,
+            kernel_info=compilation_kernel_info,
+        )
 
         # If compile_only is set, bypass execution return the jit_executor directly
         if compile_only:
