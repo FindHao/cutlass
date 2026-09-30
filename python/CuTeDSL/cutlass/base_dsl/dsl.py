@@ -422,6 +422,15 @@ class BaseDSL(metaclass=DSLSingletonMeta):
         self._scoped_compilation_listeners: ContextVar[
             tuple[Callable[..., None], ...]
         ] = ContextVar(f"{self.name}_compilation_listeners", default=())
+        # Synchronous callbacks run before each invocation of a compiled host
+        # function. Signature: listener(owner, *, function_name, module_hash,
+        # kernel_info, args, kwargs, arg_names, exe_args, executor). Listener
+        # exceptions are wrapped by the caller. Fired for implicit launches
+        # and calls to compiled functions; see register_launch_listener.
+        self._launch_listeners: list[Callable[..., None]] = []
+        self._scoped_launch_listeners: ContextVar[tuple[Callable[..., None], ...]] = (
+            ContextVar(f"{self.name}_launch_listeners", default=())
+        )
 
         if preprocess:
             preprocessor: DSLPreprocessor = DSLPreprocessor(dsl_package_name)
@@ -1750,9 +1759,10 @@ class BaseDSL(metaclass=DSLSingletonMeta):
         The listener is called synchronously as ``listener(owner, *,
         function_name, module_hash, cache_hit, artifacts, compile_options,
         func_body, kernel_info)``, where ``owner`` is this DSL instance,
-        ``module_hash`` identifies the compiled specialization, ``cache_hit``
-        is ``True`` only for an in-memory cache hit; a function loaded from
-        the file cache is reported like a fresh compilation, with
+        ``module_hash`` identifies the compiled specialization (launch
+        listeners receive the same hash for its calls), ``cache_hit`` is
+        ``True`` only for an in-memory cache hit; a function loaded from the
+        file cache is reported like a fresh compilation, with
         ``cache_hit=False``. ``artifacts`` is the ``JitFunctionArtifacts`` of
         the compiled function (possibly holding ``None`` entries when artifact
         keeping is off), ``func_body`` is the original Python function, and
@@ -1865,6 +1875,166 @@ class BaseDSL(metaclass=DSLSingletonMeta):
                 # DSLRuntimeError inherits DSLBaseError, which formats ``cause``.
                 raise DSLRuntimeError(
                     f"Compilation listener failed: {listener_name}", cause=e
+                ) from e
+
+    def register_launch_listener(self, listener: Callable[..., None]) -> None:
+        """Register a callback run before each call to a compiled host function.
+
+        Invocations are the implicit launch of a ``@jit`` call and every call
+        to a compiled function, TVM FFI ones included. Calls through an
+        executor returned by ``to(device)`` are not reported, except with TVM
+        FFI, where ``to`` returns the compiled function itself.
+
+        Each notification describes one host-function invocation, which may
+        launch zero, one, or multiple GPU kernels. The callback is not invoked
+        separately for each GPU kernel. ``function_name`` names the compiled
+        host entry point, and ``kernel_info`` describes kernels in that
+        compilation.
+
+        The listener is called synchronously as ``listener(owner, *,
+        function_name, module_hash, kernel_info, args, kwargs, arg_names,
+        exe_args, executor)``, where:
+
+        - ``owner`` is this DSL instance.
+        - ``module_hash`` is the hash the compilation listeners received for
+          the compiled function, which ties the call to its compilation. It
+          is ``None`` for a function compiled with caching off (for example by
+          ``cute.compile``) while no listener was registered.
+        - ``args``/``kwargs`` are the runtime arguments, without ``Constexpr``
+          parameters. An implicit launch reports every runtime parameter with
+          defaults applied, positional ones in ``args`` in declaration order
+          and keyword-only ones in ``kwargs``. A call to a compiled function
+          reports the arguments as passed.
+        - ``arg_names`` names the runtime parameters, positional ones first,
+          so ``args[i]`` binds to ``arg_names[i]`` (positional arguments past
+          ``len(arg_names)`` are extra trailing arguments).
+        - ``exe_args`` is the argument list handed to the compiled program, in
+          a backend-specific form, or ``None`` on a TVM FFI call to a compiled
+          function, where tvm-ffi converts the arguments itself.
+        - ``executor`` is the ``JitExecutor`` serving the call, or ``None``
+          on the first call and with TVM FFI.
+
+        Listeners run before the call itself, so a call that fails
+        afterwards, for example because TVM FFI rejects its arguments, is
+        still reported. An exception from a listener is raised as
+        ``DSLRuntimeError`` and the call does not happen. Listeners must treat
+        the payload as read-only; for example, ``exe_args`` is the list that
+        is then passed to the compiled program. More keyword arguments may be
+        added later, so listeners should accept ``**kwargs``. Passing ``None``
+        raises ``DSLRuntimeError``; registering the same listener object more
+        than once is ignored.
+        """
+        if listener is None:
+            raise DSLRuntimeError("Launch listener must not be None.")
+        if not callable(listener):
+            raise DSLRuntimeError("Launch listener must be callable.")
+        if listener not in self._launch_listeners:
+            self._launch_listeners.append(listener)
+
+    def remove_launch_listener(self, listener: Callable[..., None]) -> None:
+        """Remove a previously registered launch listener (no-op if absent)."""
+        if listener in self._launch_listeners:
+            self._launch_listeners.remove(listener)
+
+    @contextmanager
+    def launch_listeners(
+        self,
+        listeners: Callable[..., None] | Iterable[Callable[..., None]],
+    ) -> Generator[None, Any, None]:
+        """Temporarily register launch listeners in the current context.
+
+        Args:
+            listeners: A single listener or iterable of listeners, each called
+                as ``listener(owner, *, function_name, module_hash,
+                kernel_info, args, kwargs, arg_names, exe_args, executor)``.
+
+        Scoped listeners are stored in ``_scoped_launch_listeners`` for the
+        duration of the context, preserving order and ignoring duplicates. The
+        context manager restores the previous listener state when the ``with``
+        block exits.
+
+        Raises:
+            DSLRuntimeError: If ``listeners`` is neither callable nor iterable,
+                or if any listener entry is ``None`` or not callable.
+        """
+        scoped_listeners: tuple[Callable[..., None], ...]
+        if callable(listeners):
+            scoped_listeners = (listeners,)
+        else:
+            try:
+                scoped_listeners = tuple(listeners)
+            except TypeError as e:
+                raise DSLRuntimeError(
+                    "Launch listeners must be callable or iterable."
+                ) from e
+
+        for listener in scoped_listeners:
+            if listener is None:
+                raise DSLRuntimeError("Launch listener must not be None.")
+            if not callable(listener):
+                raise DSLRuntimeError("Launch listener must be callable.")
+
+        current_listeners = self._scoped_launch_listeners.get()
+        combined_listeners = list(current_listeners)
+        for listener in scoped_listeners:
+            if listener not in combined_listeners:
+                combined_listeners.append(listener)
+        token = self._scoped_launch_listeners.set(tuple(combined_listeners))
+        try:
+            yield
+        finally:
+            self._scoped_launch_listeners.reset(token)
+
+    def _has_launch_listeners(self) -> bool:
+        """Whether any launch listener is registered or in scope."""
+        return bool(self._launch_listeners or self._scoped_launch_listeners.get())
+
+    def _run_launch_listeners(
+        self,
+        jit_function: JitCompiledFunction,
+        *,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        exe_args: list[Any] | None,
+    ) -> None:
+        """Report a launch of ``jit_function``. Callers check
+        ``_has_launch_listeners()`` first, which keeps launches without
+        listeners cheap."""
+        listeners = list(self._launch_listeners)
+        for listener in self._scoped_launch_listeners.get():
+            if listener not in listeners:
+                listeners.append(listener)
+
+        execution_args = getattr(jit_function, "execution_args", None)
+        arg_names = (
+            tuple(execution_args._meta.all_names) if execution_args is not None else ()
+        )
+        # Not every compiled function carries these, e.g. wrappers that only
+        # forward part of the JitCompiledFunction surface.
+        module_hash = getattr(jit_function, "module_hash", None)
+        executor = getattr(jit_function, "_default_executor", None)
+        for listener in listeners:
+            try:
+                listener(
+                    self,
+                    function_name=jit_function.function_name,
+                    module_hash=module_hash,
+                    kernel_info=jit_function.kernel_info,
+                    args=args,
+                    kwargs=kwargs,
+                    arg_names=arg_names,
+                    exe_args=exe_args,
+                    executor=executor,
+                )
+            except Exception as e:
+                listener_name = getattr(
+                    listener,
+                    "__qualname__",
+                    getattr(listener, "__name__", repr(listener)),
+                )
+                # DSLRuntimeError inherits DSLBaseError, which formats ``cause``.
+                raise DSLRuntimeError(
+                    f"Launch listener failed: {listener_name}", cause=e
                 ) from e
 
     def _compile_clone_and_save(
@@ -2065,6 +2235,8 @@ class BaseDSL(metaclass=DSLSingletonMeta):
             (
                 self._compilation_listeners,
                 self._scoped_compilation_listeners.get(),
+                self._launch_listeners,
+                self._scoped_launch_listeners.get(),
             )
         )
         module_hash = (
@@ -2231,6 +2403,7 @@ class BaseDSL(metaclass=DSLSingletonMeta):
             dynamic_kwargs=dynamic_kwargs,
             host_target=self.compile_options.host_target,
             module_hash=module_hash,
+            owner=self,
         )
         if isinstance(fn, JitCompiledFunction):
             fn.execution_args.set_adapter_scope(self._jit_arg_adapter_scope)
@@ -2551,7 +2724,16 @@ class BaseDSL(metaclass=DSLSingletonMeta):
         if compile_only:
             return jit_function
 
-        # Run the compiled program
+        # Run the compiled program. Launch listeners get the dynamic
+        # (non-Constexpr) arguments, the ones a direct call to the compiled
+        # function takes.
+        if self._has_launch_listeners():
+            self._run_launch_listeners(
+                jit_function,
+                args=tuple(dynamic_args),
+                kwargs=dict(dynamic_kwargs),
+                exe_args=exe_args,
+            )
         jit_function.run_compiled_program(exe_args)
 
         return result

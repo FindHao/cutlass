@@ -10,12 +10,14 @@
 # is strictly prohibited.
 
 """
-Unit tests for the compilation listeners of ``BaseDSL``.
+Unit tests for the compilation and launch listeners of ``BaseDSL``.
 
 External tracers register these listeners to observe every compiled
-specialization. A compilation listener runs after each compilation or
-in-memory cache hit and receives the module hash, which identifies the
-specialization.
+specialization and every call that runs it. A compilation listener runs after
+each compilation or in-memory cache hit; a launch listener runs before each call
+to a compiled host function, once per call however many kernels it launches,
+and receives the runtime arguments of the call. Both receive the module hash,
+which is how a tracer ties a call to the compilation behind it.
 
 The tests compile and launch a small kernel, so they need a CUDA GPU and skip
 without one.
@@ -23,6 +25,7 @@ without one.
 
 import contextvars
 import functools
+import importlib.util
 import re
 import unittest
 from unittest import mock
@@ -48,6 +51,18 @@ def _fill(t: cute.Tensor, value: cutlass.Int32):
 @cute.jit
 def _launch(t: cute.Tensor, value: cutlass.Int32, threads: cutlass.Constexpr[int]):
     _fill(t, value).launch(grid=[1, 1, 1], block=[threads, 1, 1])
+
+
+@cute.kernel
+def _add(t: cute.Tensor, value: cutlass.Int32):
+    tidx, _, _ = cute.arch.thread_idx()
+    t[tidx] = t[tidx] + value
+
+
+@cute.jit
+def _fill_then_add(t: cute.Tensor, value: cutlass.Int32):
+    _fill(t, value).launch(grid=[1, 1, 1], block=[32, 1, 1])
+    _add(t, value).launch(grid=[1, 1, 1], block=[32, 1, 1])
 
 
 @cute.kernel
@@ -77,6 +92,14 @@ class _Recorder:
 
 def _failing_listener(owner, **kwargs):
     raise ValueError("listener bug")
+
+
+def _bind(call):
+    """Name each runtime argument of a launch the way a tracer does: ``args[i]``
+    binds to ``arg_names[i]``, and ``kwargs`` are keyed by name already."""
+    bound = dict(zip(call["arg_names"], call["args"]))
+    bound.update(call["kwargs"])
+    return bound
 
 
 def _flat_message(exc):
@@ -111,13 +134,18 @@ class _ListenerTestCase(unittest.TestCase):
 
     def listener_apis(self):
         """``(scope, register, remove)`` for each kind of listener. Every
-        ``_launch`` call notifies a compilation listener once, on the
-        compilation or cache hit."""
+        ``_launch`` call notifies each kind once: a compilation listener on the
+        compilation or cache hit, and a launch listener on the launch."""
         return {
             "compilation": (
                 self.dsl.compilation_listeners,
                 self.dsl.register_compilation_listener,
                 self.dsl.remove_compilation_listener,
+            ),
+            "launch": (
+                self.dsl.launch_listeners,
+                self.dsl.register_launch_listener,
+                self.dsl.remove_launch_listener,
             ),
         }
 
@@ -289,6 +317,169 @@ class TestCompilationListener(_ListenerTestCase):
         _launch(self.t, 2, 32)
         torch.cuda.synchronize()
         self.assertTrue(torch.all(self.data == 2))
+
+
+class TestLaunchListener(_ListenerTestCase):
+    def test_arguments_bind_to_their_names_on_every_path(self):
+        """Implicit calls and direct calls to a compiled function report the
+        runtime arguments, without the Constexpr ``threads``."""
+        compiled = cute.compile(_launch, self.t, 1, 32)
+        listener = _Recorder()
+        with self.dsl.launch_listeners(listener):
+            _launch(self.t, 3, 32)
+            _launch(self.t, value=4, threads=32)
+            compiled(self.t, 5)
+            compiled(self.t, value=6)
+        self.assertEqual(
+            [_bind(call) for call in listener.calls],
+            [{"t": self.t, "value": value} for value in (3, 4, 5, 6)],
+        )
+        for call in listener.calls:
+            self.assertEqual(call["arg_names"], ("t", "value"))
+        # The listener sees the objects the caller passed.
+        self.assertIs(listener.calls[0]["args"][0], self.t)
+        # An implicit launch reports the runtime parameters in declaration
+        # order, while a direct call reports keyword arguments as keywords.
+        self.assertEqual(listener.calls[1]["args"], (self.t, 4))
+        self.assertEqual(listener.calls[3]["kwargs"], {"value": 6})
+        # The kernel still ran, with the last value.
+        torch.cuda.synchronize()
+        self.assertTrue(torch.all(self.data == 6))
+
+    def test_launch_carries_the_hash_of_its_compilation(self):
+        compilations, launches = _Recorder(), _Recorder()
+        with (
+            self.dsl.compilation_listeners(compilations),
+            self.dsl.launch_listeners(launches),
+        ):
+            _launch(self.t, 1, 32)
+            _launch(self.t, 1, 16)
+            compiled = cute.compile(_launch, self.t, 1, 8)
+            compiled(self.t, 1)
+        self.assertEqual(
+            launches.field("module_hash"), compilations.field("module_hash")
+        )
+        self.assertEqual(
+            launches.field("function_name"), compilations.field("function_name")
+        )
+        self.assertEqual(launches.owners, [self.dsl] * 3)
+
+    def test_compilation_is_reported_before_its_launch(self):
+        events = []
+        with (
+            self.dsl.compilation_listeners(
+                lambda owner, **kwargs: events.append("compilation")
+            ),
+            self.dsl.launch_listeners(lambda owner, **kwargs: events.append("launch")),
+        ):
+            _launch(self.t, 1, 32)
+            _launch(self.t, 1, 32)
+        self.assertEqual(events, ["compilation", "launch"] * 2)
+
+    def test_one_notification_per_host_call(self):
+        """A launch listener reports each call to a compiled host function once,
+        however many kernels the call launches."""
+        compiled = cute.compile(_fill_then_add, self.t, 7)
+        listener = _Recorder()
+        with self.dsl.launch_listeners(listener):
+            _fill_then_add(self.t, 7)
+            compiled(self.t, 7)
+        self.assertEqual(len(listener.calls), 2)
+        for call in listener.calls:
+            # kernel_info describes the kernels of the compilation.
+            self.assertEqual(len(call["kernel_info"]), 2)
+        # Both kernels ran: fill with 7, then add 7.
+        torch.cuda.synchronize()
+        self.assertTrue(torch.all(self.data == 14))
+
+    def test_listener_error_aborts_the_launch(self):
+        compiled = cute.compile(_launch, self.t, 1, 32)
+        with self.dsl.launch_listeners(_failing_listener):
+            with self.assertRaises(DSLRuntimeError) as ctx:
+                compiled(self.t, 9)
+        self.assertIn(
+            "Launch listener failed: _failing_listener", _flat_message(ctx.exception)
+        )
+        self.assertIsInstance(ctx.exception.__cause__, ValueError)
+        # Launch listeners run before the kernel, so it never ran.
+        torch.cuda.synchronize()
+        self.assertTrue(torch.all(self.data == 0))
+
+
+@unittest.skipUnless(importlib.util.find_spec("tvm_ffi"), "needs apache-tvm-ffi")
+class TestTVMFFILaunch(_ListenerTestCase):
+    """With TVM FFI, a compiled function launches through its own ``__call__``
+    instead of ``JitCompiledFunction.__call__``."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch_envar(enable_tvm_ffi=True)
+        self.t = from_dlpack(self.data, enable_tvm_ffi=True)
+
+    def test_each_launch_is_reported_once(self):
+        compiled = cute.compile(_launch, self.t, 1, 32)
+        listener = _Recorder()
+        with self.dsl.launch_listeners(listener):
+            _launch(self.t, 3, 32)
+            compiled(self.t, 4)
+            compiled(self.t, value=5)
+        self.assertEqual(
+            [_bind(call) for call in listener.calls],
+            [{"t": self.t, "value": value} for value in (3, 4, 5)],
+        )
+        # tvm-ffi converts the arguments of a direct call itself, so there are
+        # no packed arguments to report.
+        self.assertIsNone(listener.calls[1]["exe_args"])
+        torch.cuda.synchronize()
+        self.assertTrue(torch.all(self.data == 5))
+
+    def test_function_without_runtime_arguments(self):
+        """Such a function compiles to the positional-only TVM FFI class,
+        which has a ``__call__`` of its own."""
+        # Imported here: the module needs tvm_ffi.
+        from cutlass.cutlass_dsl.tvm_ffi_provider import TVMFFIJitCompiledFunction
+
+        compiled = cute.compile(_launch_empty, 32)
+        self.assertIsInstance(compiled, TVMFFIJitCompiledFunction)
+        listener = _Recorder()
+        with self.dsl.launch_listeners(listener):
+            compiled()
+        (call,) = listener.calls
+        self.assertEqual((call["args"], call["kwargs"]), ((), {}))
+
+    def test_uninitialized_function_is_not_reported(self):
+        """A function that cannot run (for example one compiled for another
+        architecture) fails before the listeners hear of the call."""
+        from cutlass.cutlass_dsl.tvm_ffi_provider import (
+            TVMFFIJitCompiledFunction,
+            TVMFFIJitCompiledFunctionWithKwargs,
+        )
+
+        positional = cute.compile(_launch_empty, 32)
+        with_kwargs = cute.compile(_launch, self.t, 1, 32)
+        self.assertIsInstance(positional, TVMFFIJitCompiledFunction)
+        self.assertIsInstance(with_kwargs, TVMFFIJitCompiledFunctionWithKwargs)
+        cases = (
+            (
+                positional,
+                (),
+                mock.patch.object(
+                    TVMFFIJitCompiledFunction, "__chandle__", return_value=0
+                ),
+            ),
+            (
+                with_kwargs,
+                (self.t, 1),
+                mock.patch.object(with_kwargs, "_kwargs_wrapper", None),
+            ),
+        )
+        for compiled, args, uninitialized in cases:
+            with self.subTest(cls=type(compiled).__name__):
+                listener = _Recorder()
+                with uninitialized, self.dsl.launch_listeners(listener):
+                    with self.assertRaises(DSLRuntimeError):
+                        compiled(*args)
+                self.assertEqual(listener.calls, [])
 
 
 if __name__ == "__main__":
