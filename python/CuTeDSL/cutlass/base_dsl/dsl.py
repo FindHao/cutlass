@@ -410,9 +410,14 @@ class BaseDSL(metaclass=DSLSingletonMeta):
         self.launch_inner_count: int = 0
         # initialize default compile options
         self.compile_options: CompileOptions = CompileOptions()
-        # Path of the dumped MLIR file; set by build_module when KEEP=ir/ir-clean
-        # is active, otherwise left None so downstream reads have a defined value.
+        # Path of the dumped MLIR file; set by build_module when KEEP=ir or
+        # KEEP=ir-debug is active, otherwise left None so downstream reads have a
+        # defined value. With KEEP=ir it points at the clean dump (after
+        # canonicalize+cse), and with only KEEP=ir-debug at the raw dump.
         self.dump_mlir_path: Any = None
+        # Path of the raw (pre-pass) dump; set by build_module when KEEP=ir-debug
+        # is active.
+        self.dump_mlir_raw_path: Any = None
         # Hooks run synchronously at points of the compilation, one channel per
         # HookEvent; see register_hook.
         self._hooks: dict[HookEvent, HookChannel] = {
@@ -1825,8 +1830,13 @@ class BaseDSL(metaclass=DSLSingletonMeta):
 
         Used by the KEEP=ir / KEEP=ir-after-<pass> debug dumps: cloning keeps the
         original module unmutated while the mini-pipeline runs on the copy.
+        The clone goes through bytecode so source locations survive; the
+        textual form either drops them (``str(module)``) or, with debug info,
+        uses location aliases that some ops' parsers reject.
         """
-        module_clone = ir.Module.parse(str(module))
+        buffer = io.BytesIO()
+        module.operation.write_bytecode(buffer)
+        module_clone = ir.Module.parse(buffer.getvalue())
         self.compiler_provider.compile(
             module_clone,
             pipeline,
@@ -1846,7 +1856,7 @@ class BaseDSL(metaclass=DSLSingletonMeta):
 
         # Save IR in a file (raw, before any passes) -- triggered by KEEP=ir-debug
         if self.envar.keep_ir:
-            self.dump_mlir_path = save_ir(
+            self.dump_mlir_raw_path = self.dump_mlir_path = save_ir(
                 self.name,
                 module,
                 function_name,
@@ -2176,6 +2186,7 @@ class BaseDSL(metaclass=DSLSingletonMeta):
                     if (self.envar.keep_ir or self.envar.keep_ir_clean)
                     else None
                 ),
+                MLIR_RAW=(str(self.dump_mlir_raw_path) if self.envar.keep_ir else None),
             ),
             # set dynamic arguments if the jit_function is a JitCompiledFunction for AOT generation.
             dynamic_args=dynamic_args,
